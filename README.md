@@ -3,9 +3,9 @@
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![Chat Completions](https://img.shields.io/badge/backend-Chat_Completions-475569)
 
-**用普通 Chat API，提供可配置的 Jev 兼容决策端点。**
+在本地启动一个 HTTP 服务，让需要 Jev 接口的应用通过 `POST /v1/systemone` 提交状态和问题，获得判断、分类或评分。部署者在 TOML 文件中选择上游模型、提示词、比较方式和概率处理，接入应用无需管理这些设置。模型推理由配置的 Chat Completions API 完成，上游可以是云端服务或本地模型服务。
 
-把 Chat Completions API 封装成类型化决策服务。业务侧传入状态和问题，获得判断、分类或评分；服务侧通过一份 TOML 配置输出读取模式、提示词、比较方式和概率处理。默认读取首 token `logprobs`，也可选择模型直接报告数值概率。
+默认读取首 token `logprobs`，也可选择模型直接报告数值概率。
 
 [快速启动](#启动) · [配置指南](docs/configuration.md) · [API 兼容性](docs/api.md) · [概率与诊断](docs/probabilities.md)
 
@@ -17,7 +17,7 @@
            Noul / Choice / Score ← 解析与聚合
 ```
 
-| 能力 | 用途 |
+| 功能 | 用途 |
 | --- | --- |
 | Noul / Choice / Score | 是非判断、候选分类、分档评分 |
 | 可选图片输入 | 兼容端点直接携带 base64／data URL 图片，转发给视觉上游 |
@@ -28,11 +28,7 @@
 | 概率质量诊断 | 查看归一化前质量、缺失标签和质量上下界 |
 | stdin 热重载 | 运行中切换完整配置，在途请求保持原配置 |
 
-无需 GPU、SGLang、完整词表或选定-token 查询接口。默认模式每个比较分支只请求一个输出 token；直接报告模式生成完整 JSON，不要求 logprobs。安装后可独立运行，无前端构建步骤。
-
-提供 Jev 风格的 Noul、Choice、Score 请求与响应，判断由配置的上游模型完成。接口说明见 [API 兼容性](docs/api.md)。
-
-需要每次请求携带推理配置时，使用 `POST /v1/evaluate`；加 `dry_run: true` 可直接预览。见 [扩展端点](docs/api.md#扩展端点) 和 [请求示例](examples/evaluate.json)，无需预先注册配置。
+默认模式每个比较分支请求一个输出 token 及其 logprobs；直接报告模式生成 JSON 数值分布。接口格式见 [API 兼容性](docs/api.md)。
 
 使用视觉上游时，在服务配置中设置 `upstream.supports_images = true`，并在原请求中添加可选 `images`。见 [图片格式与限制](docs/api.md#图片输入) 和 [内含小图片的请求示例](examples/image-request.json)。
 
@@ -70,18 +66,13 @@ curl http://127.0.0.1:8080/v1/systemone \
 
 PowerShell 可用 `curl.exe`，把命令写在一行。业务客户端的 base URL 指向本服务，model 使用 `jev-latest` 或配置中的上游模型名。一个服务实例使用一份配置，不根据请求动态切换上游账户。
 
-## 配置与请求入口
+## 配置默认行为
 
-| 入口 | 推理配置 | 返回 |
-| --- | --- | --- |
-| `POST /v1/systemone` | 服务当前 TOML | 兼容答案 |
-| `POST /v1/evaluate` | 请求内完整 `execution`；省略字段取代码默认值 | 有效配置、告警与兼容答案；`dry_run` 返回调用计划 |
+`/v1/systemone` 使用服务当前加载的 TOML 配置。例如，启用双循环后，应用仍提交同样的分类问题，服务负责展开比较并聚合结果；调用次数和延迟会随配置变化。
 
-扩展端点不需要注册 profile，不保存请求配置。上游账户、模型连接和服务容量仍由部署端管理。两个入口接受同一套问题和可选图片，详见 [API](docs/api.md)。
+在 [config.toml](config.toml) 中设置提示词、读取模式、双循环、呼号和概率后处理温度。Noul 固定一次 Yes/No 判断；双循环只用于 Choice/Score。生成温度与概率后处理温度分别配置，依赖与限制见 [配置指南](docs/configuration.md)。
 
-[config.toml](config.toml) 是完整起点。可编辑提示词、选择读取模式，组合双循环、呼号和概率后处理温度。Noul 固定一次 Yes/No 判断；双循环只用于 Choice/Score。生成温度与概率后处理温度分别配置，依赖与限制见 [配置指南](docs/configuration.md)。
-
-以下配置均可直接通过 `--config` 使用：
+以下配置均可直接通过 `--config` 使用。它们展示不同方法，效果需结合自己的模型和任务评估：
 
 - [直接报告概率](examples/reported-probability.toml)：生成 JSON 数值分布，不要求 logprobs。
 - [温度缩放](examples/calibrated.toml)、[呼号](examples/callsigns.toml)、[双循环](examples/round-robin.toml)。
@@ -105,6 +96,12 @@ jev-simulator evaluate --config config.toml --request examples/request.json \
 预览、命令行运行和 HTTP 服务共用同一个计划、解析和聚合实现。完整诊断包含提示词、原始概率及映射，可能含输入隐私；只在明确指定路径时写入，本仓库默认忽略 `diagnostics/`。
 
 HTTP 进程把结构化事件写到 **stderr**，包含请求 ID、配置 ID、模式和告警；logprobs 模式另有概率质量和缺失标签数量。
+
+## 进阶：每次请求指定推理配置
+
+需要远程比较配置，或让应用为不同请求选择不同推理方法时，可使用 `POST /v1/evaluate`。请求中的 `execution` 指定本次推理配置，省略字段使用代码默认值；不会修改服务的 TOML，也不会影响其他请求。上游连接、密钥和服务容量仍由部署者配置。
+
+设置 `dry_run: true` 可预览调用计划，设为 false 则执行并返回结果。该端点不保存配置，也不用于管理服务。请求格式见 [扩展端点](docs/api.md#扩展端点) 和 [完整示例](examples/evaluate.json)。
 
 ## 文档
 

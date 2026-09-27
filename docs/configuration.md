@@ -1,8 +1,8 @@
 # 配置指南
 
-一个进程使用一份完整 TOML，通过 `--config` 选择启动文件，也可以在运行中用 stdin 命令替换。`jev-simulator check --config PATH` 校验本地配置；`evaluate` 用于实际调用上游。
+一个进程使用一份完整 TOML，通过 `--config` 选择启动文件，也可以在运行中用 stdin 命令替换。兼容端点 `POST /v1/systemone` 按这份配置执行，调用方只需提交状态、问题和可选图片。`jev-simulator check --config PATH` 校验本地配置；`jev-simulator evaluate` 用于从命令行实际调用上游。
 
-HTTP 请求可通过 [`POST /v1/evaluate`](api.md#扩展端点) 的 `execution` 携带本次 `adapter/prompt/generation/diagnostics`，使用同一套字段和依赖校验。省略字段使用代码默认值，不合并服务推理配置；不会修改 TOML 或影响其他请求。上游连接与服务设置仍由部署管理。`dry_run: true` 返回有效配置和调用计划。
+需要逐请求选择推理方法时，可通过可选的扩展端点 [`POST /v1/evaluate`](api.md#扩展端点) 的 `execution` 携带本次 `adapter/prompt/generation/diagnostics`，使用同一套字段和依赖校验。省略字段使用代码默认值，不合并服务推理配置；不会修改 TOML 或影响其他请求。上游连接与服务设置仍由部署管理。`dry_run: true` 返回有效配置和调用计划。
 
 ## 选择与重载
 
