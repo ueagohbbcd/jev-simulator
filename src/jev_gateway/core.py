@@ -57,6 +57,8 @@ def _branch(
     callsigns: list[str],
     prompt: dict[str, str],
     pair: list[str] | None,
+    mode: str = "token_logprobs",
+    image_urls: list[str] | None = None,
 ) -> dict[str, Any]:
     kind = question["type"]
     if kind == "noul":
@@ -68,32 +70,51 @@ def _branch(
 
     mapping = dict(zip(tokens, semantic_keys, strict=True))
     option_lines = [f"{token}: {description}" for token, description in zip(tokens, descriptions, strict=True)]
-    output = "Output exactly one of: " + ", ".join(tokens) + "."
+    if mode == "reported_probability":
+        keys = ", ".join(json.dumps(token, ensure_ascii=False) for token in tokens)
+        output = (
+            "Output only one JSON object with exactly these keys: " + keys + ". "
+            "Each value must be a numeric probability from 0 to 1; "
+            "all values must sum to 1. Do not add other keys or text."
+        )
+    else:
+        output = "Output exactly one of: " + ", ".join(tokens) + "."
     values = {
         "state": _text(state),
         "instructions": _text(question["instructions"]),
         "options": "\n".join(option_lines),
         "output": output,
     }
+    user_text = _render(prompt["user"], values)
+    user_content: str | list[dict[str, Any]] = user_text
+    if image_urls:
+        user_content = [
+            {"type": "image_url", "image_url": {"url": url}} for url in image_urls
+        ] + [{"type": "text", "text": user_text}]
     return {
         "question_id": question_id,
         "index": index,
         "mapping": mapping,
         "messages": [
             {"role": "system", "content": _render(prompt["system"], values)},
-            {"role": "user", "content": _render(prompt["user"], values)},
+            {"role": "user", "content": user_content},
         ],
         "pair": pair,
     }
 
 
-def build_plan(payload: dict[str, Any], config: dict[str, Any]) -> list[dict[str, Any]]:
+def build_plan(
+    payload: dict[str, Any], config: dict[str, Any], *, image_urls: list[str] | None = None
+) -> list[dict[str, Any]]:
     """Build all independent completion branches for a validated request."""
+    if payload.get("images"):
+        raise CoreError("images must be validated before request planning")
     adapter = config.get("adapter", {})
     configured_callsigns = adapter.get("callsigns", _DEFAULT_CALLSIGNS)
     # An empty list disables custom callsigns and restores the stable A-Z set.
     callsigns = list(configured_callsigns) if configured_callsigns else list(_DEFAULT_CALLSIGNS)
     double_round_robin = adapter.get("double_round_robin", False)
+    mode = adapter.get("mode", "token_logprobs")
     prompt = config["prompt"]
     result: list[dict[str, Any]] = []
 
@@ -109,13 +130,13 @@ def build_plan(payload: dict[str, Any], config: dict[str, Any]) -> list[dict[str
                         result.append(_branch(
                             question_id, index, question, payload["state"], pair_keys,
                             [descriptions[position] for position in indices], callsigns,
-                            prompt, list(pair_keys),
+                            prompt, list(pair_keys), mode, image_urls,
                         ))
                         index += 1
         else:
             result.append(_branch(
                 question_id, 0, question, payload["state"], semantic_keys,
-                descriptions, callsigns, prompt, None,
+                descriptions, callsigns, prompt, None, mode, image_urls,
             ))
     return result
 
@@ -275,6 +296,79 @@ def parse_response(
         "warnings": warnings,
         "finish_reason": finish_reason,
         "sampled_first_token": row.get("token"),
+        "model": response.get("model"),
+        "system_fingerprint": response.get("system_fingerprint"),
+    }
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CoreError("reported probability JSON contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _nonfinite_constant(_: str) -> None:
+    raise CoreError("reported probability JSON contains a nonfinite number")
+
+
+def parse_reported_response(
+    response: dict[str, Any], mapping: dict[str, str], temperature: float
+) -> dict[str, Any]:
+    """Read a complete JSON distribution without inventing token evidence."""
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise CoreError("temperature must be finite and positive")
+    try:
+        choices = response["choices"]
+        if not isinstance(choices, list) or len(choices) != 1:
+            raise CoreError("expected exactly one completion choice")
+        choice = choices[0]
+        if not isinstance(choice, dict) or choice.get("finish_reason") != "stop":
+            raise CoreError("reported completion did not finish normally")
+        message = choice["message"]
+        if not isinstance(message, dict) or message.get("refusal"):
+            raise CoreError("reported completion was refused or malformed")
+        content = message["content"]
+    except (KeyError, TypeError) as exc:
+        raise CoreError("reported completion is malformed") from exc
+    if not isinstance(content, str):
+        raise CoreError("reported completion content must be text")
+    try:
+        reported = json.loads(
+            content, object_pairs_hook=_unique_object, parse_constant=_nonfinite_constant
+        )
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise CoreError("reported completion is not valid JSON") from exc
+    if not isinstance(reported, dict) or set(reported) != set(mapping):
+        raise CoreError("reported completion must contain exactly the branch labels")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or value < 0
+        or value > 1
+        or not math.isfinite(value)
+        for value in reported.values()
+    ):
+        raise CoreError("reported probabilities must be finite numbers in [0, 1]")
+    total = math.fsum(reported.values())
+    if abs(total - 1.0) > 1e-6:
+        raise CoreError("reported probabilities must sum to one")
+    # Accept only tiny numerical drift, then put the vector on the simplex.
+    raw = {semantic: float(reported[label]) / total for label, semantic in mapping.items()}
+    calibrated = raw if temperature == 1 else _softmax(
+        {semantic: math.log(value) if value else -math.inf for semantic, value in raw.items()},
+        temperature,
+    )
+    return {
+        "probabilities": calibrated,
+        "raw_probabilities": raw,
+        "reported_label_probabilities": reported,
+        "raw_output": content,
+        "normalization_delta": total - 1.0,
+        "warnings": [],
+        "finish_reason": "stop",
         "model": response.get("model"),
         "system_fingerprint": response.get("system_fingerprint"),
     }

@@ -18,6 +18,54 @@ Score 等级从 0 开始，结果可以是小数。结构化等级描述在 lege
 
 每个 HTTP 响应通过 `x-typesafe-request-id` 关联日志，`x-jev-config-id` 标识有效配置。诊断不混入标准 answers。
 
+## 图片输入
+
+`/v1/systemone` 顶层增加可选 `images`，`/v1/evaluate` 放在 `request.images`。省略或空数组保持纯文本行为和原响应结构；这是模拟器的扩展字段，不保证其他 System One 服务接受。
+
+```json
+"images": [
+  {"data": "data:image/png;base64,..."},
+  {"type": "image/jpeg", "data": "<base64 图片字节>"}
+]
+```
+
+支持 JPEG、PNG、WebP、静态 GIF。只接受内联图片内容，不读取本地路径或远程 URL。图片按顺序加入每个调用的 user 消息，位于模板渲染的文本之前；上游收到标准 Chat Completions `image_url` 内容块。普通 state 对象继续作为文本，不解释其中的图片链接。双循环的每个分支都会携带图片，因此图片输入用量也会随调用次数增加。
+
+部署须设置 `upstream.supports_images = true`，表示已选择支持图片的上游；这不是自动能力探测。默认关闭，带图片请求返回 422。两种读取模式都能携带图片，上游还须支持该模式要求的 logprobs 或 JSON 输出。
+
+最多 8 张，每张解码后的上传文件不超过 12 MiB、合计 32 MiB，每张不超过 1600 万像素。服务校验内容与声明格式，拒绝动画和损坏图片，应用 EXIF 方向并去除元数据，在内存中转为 PNG；转换后合计也不得超过 32 MiB，不落临时文件。请求体仍受 `server.max_body_bytes` 限制，默认 2 MiB（包含 base64）；较大图片需由部署端提高，例如 48 MiB。
+
+[image-request.json](../examples/image-request.json) 内含一张小红色色块，可直接用于兼容端点。预览与完整诊断包含转换后的图片数据；普通日志与校验错误不包含图片内容。`dry_run` 会执行本地图片校验与转换，但不调用上游。
+
+## 扩展端点
+
+`POST /v1/evaluate` 接收 `{request, execution, dry_run}`。`request` 为上述 System One 请求；必填的 `execution` 是本次推理配置，仅允许 `adapter`、`prompt`、`generation`、`diagnostics`。字段说明与 TOML 相同，省略字段取代码默认值，不继承运行中服务的推理设置。`execution: {}` 表示代码默认推理配置。
+
+上游连接、模型、密钥、供应商扩展参数和服务容量由进入请求时的服务快照提供，不能通过 execution 覆盖。模型名称仍按兼容端点规则校验。没有 profile 名称、配置注册或会话状态；本次配置不会改动服务默认值。
+
+```json
+{
+  "request": {
+    "model": "jev-latest",
+    "state": "一枚公平硬币已抛出，结果未观察。",
+    "questions": {"heads": {"type": "noul", "instructions": "结果是正面吗？"}}
+  },
+  "execution": {
+    "adapter": {"mode": "reported_probability"},
+    "prompt": {"system": "Report probabilities using the evidence. Return only the requested JSON."}
+  },
+  "dry_run": true
+}
+```
+
+`dry_run` 默认 false。true 时不调用上游，返回有效 `execution`、`config_id`、`warnings` 和 `plan`（`request_count` 与展开后的 `requests`，含实际提示词和映射）。false 时返回相同配置元数据及 `result`，后者是完整兼容答案。两种路径共用配置校验与调用计划；预览不保证上游在线、支持该协议或模型输出有效。
+
+完整示例见 [evaluate.json](../examples/evaluate.json)。向此端点发送该文件可预览，改为 `dry_run: false` 执行。两种入口共用鉴权、并发池、调用数及请求大小限制。`/v1/limits` 的候选容量描述服务默认配置；本次呼号产生的候选限制由本次计划校验。
+
+非法组合返回 422 及字段位置；合法但不适用的设置以 `warnings` 返回。例如全为 Noul 时开启双循环或自定义呼号，以及直接报告模式显式设置 token 质量阈值。不会自动开启依赖项或修改提示词。
+
+成功响应正文 `config_id` 与响应头 `x-jev-config-id` 一致，包含本次推理配置和服务端运行配置的摘要。解析出有效配置之后的失败也使用该 ID；配置本身非法时仍使用进入请求时的服务配置 ID。响应不暴露服务端连接或密钥配置。预览包含本次输入和提示词，不写入普通服务日志。
+
 ## 辅助端点
 
 | 路由 | 用途 |
@@ -37,7 +85,7 @@ Score 等级从 0 开始，结果可以是小数。结构化等级描述在 lege
 
 ## 与官方服务、SGLang 版本的差异
 
-1. **概率获取方式**：读取 top-k 及实际采样 token。缺失目标按 0 近似；诊断提供目标质量上下界和缺失列表。目标全缺失时返回错误。
+1. **概率获取方式**：默认读取 top-k 及实际采样 token。缺失目标按 0 近似；诊断提供目标质量上下界和缺失列表。目标全缺失时返回错误。直接报告模式读取 JSON 数值分布，不要求 logprobs；非法分布返回网关错误。
 2. **候选容量**：默认 A–Z，最多 26 个候选；非空 callsigns 列表决定实际容量，最多 255。Score 最多 10 级。候选数较多时，需结合缺失标签诊断评估 top-k 的覆盖情况。`/v1/limits` 公布本实例容量。
 3. **证据布局**：聊天记录完整序列化为证据，消息角色与布局由提示词模板决定。
 4. **数值语义**：结果取决于上游模型、提示词和温度；双循环输出归一化锦标赛胜分。Choice 平局时按输入选项顺序选取。

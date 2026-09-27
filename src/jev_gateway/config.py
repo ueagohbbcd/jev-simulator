@@ -6,7 +6,7 @@ import json
 import re
 import tomllib
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -23,6 +23,7 @@ class Upstream(Strict):
     api_key_env: str = "DEEPSEEK_API_KEY"
     timeout: PositiveFloat = 60.0
     top_logprobs: int = Field(default=20, ge=1, le=20)
+    supports_images: bool = False
     extra_body: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("base_url")
@@ -52,6 +53,7 @@ class Upstream(Strict):
 
 
 class Adapter(Strict):
+    mode: Literal["token_logprobs", "reported_probability"] = "token_logprobs"
     temperature: PositiveFloat = 1.0
     double_round_robin: bool = False
     callsigns: list[str] = Field(default_factory=list, max_length=255)
@@ -87,6 +89,11 @@ class Prompt(Strict):
         return self
 
 
+class Generation(Strict):
+    temperature: float = Field(default=0.0, ge=0, le=2, allow_inf_nan=False)
+    max_tokens: int = Field(default=1024, gt=0)
+
+
 class Server(Strict):
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
@@ -110,12 +117,45 @@ class Diagnostics(Strict):
     low_mass_threshold: float = Field(default=0.99, ge=0, le=1, allow_inf_nan=False)
 
 
+def _compatible_readout(adapter: Adapter, prompt: Prompt, generation: Generation | None) -> Generation | None:
+    if adapter.mode == "token_logprobs":
+        if generation is not None:
+            raise ValueError("generation settings require adapter.mode = reported_probability")
+        return None
+    if (
+        "system" not in prompt.model_fields_set
+        or prompt.system == Prompt.model_fields["system"].default
+    ):
+        raise ValueError("reported_probability requires an explicit, customized prompt.system")
+    return generation or Generation()
+
+
+class InferenceConfig(Strict):
+    """A complete request-level inference configuration with code defaults."""
+
+    adapter: Adapter = Field(default_factory=Adapter)
+    prompt: Prompt = Field(default_factory=Prompt)
+    generation: Generation | None = None
+    diagnostics: Diagnostics = Field(default_factory=Diagnostics)
+
+    @model_validator(mode="after")
+    def compatible_readout(self):
+        self.generation = _compatible_readout(self.adapter, self.prompt, self.generation)
+        return self
+
+
 class Settings(Strict):
     upstream: Upstream = Field(default_factory=Upstream)
     adapter: Adapter = Field(default_factory=Adapter)
     prompt: Prompt = Field(default_factory=Prompt)
+    generation: Generation | None = None
     server: Server = Field(default_factory=Server)
     diagnostics: Diagnostics = Field(default_factory=Diagnostics)
+
+    @model_validator(mode="after")
+    def compatible_readout(self):
+        self.generation = _compatible_readout(self.adapter, self.prompt, self.generation)
+        return self
 
     @property
     def config_id(self) -> str:

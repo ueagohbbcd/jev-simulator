@@ -1,0 +1,15 @@
+{
+  "model": "jev-latest",
+  "state": "The attached image is a color sample.",
+  "images": [
+    {
+      "data": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAFElEQVR4nGO8IyLCgA0wYRUdtBIA0OgBFI+iBHoAAAAASUVORK5CYII="
+    }
+  ],
+  "questions": {
+    "red": {
+      "type": "noul",
+      "instructions": "Is the sample predominantly red?"
+    }
+  }
+}

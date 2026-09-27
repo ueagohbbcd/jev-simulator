@@ -11,8 +11,9 @@ from typing import Any
 
 import httpx
 
-from .config import Settings
-from .core import CoreError, aggregate, build_plan, parse_response
+from .config import InferenceConfig, Settings
+from .core import CoreError, aggregate, build_plan, parse_reported_response, parse_response
+from .images import ImageValidationError, normalize_images
 from .schema import SystemOneRequest
 
 
@@ -79,6 +80,18 @@ class Gateway:
             raise RequestError(503, "Upstream API key is not configured")
         return key
 
+    def with_execution(self, execution: InferenceConfig) -> Gateway:
+        """Use request inference settings with this snapshot's deployment resources."""
+        effective = Settings(
+            upstream=self.settings.upstream,
+            adapter=execution.adapter,
+            prompt=execution.prompt,
+            generation=execution.generation,
+            server=self.settings.server,
+            diagnostics=execution.diagnostics,
+        )
+        return Gateway(effective, self._client, capacity=self._capacity)
+
     def plan(self, payload: SystemOneRequest) -> list[dict[str, Any]]:
         """Build every branch after checking all deployment limits."""
         allowed_models = {"jev-latest", self.settings.upstream.model}
@@ -105,9 +118,17 @@ class Gateway:
         if planned_calls > self.settings.server.max_calls_per_request:
             raise RequestError(422, "Request requires too many upstream calls")
 
+        if payload.images and not self.settings.upstream.supports_images:
+            raise RequestError(422, "Configured upstream does not support images")
+        try:
+            image_urls = normalize_images(payload.images) if payload.images else None
+        except ImageValidationError as exc:
+            raise RequestError(422, str(exc)) from exc
+
         branches = build_plan(
-            payload.model_dump(mode="json"),
+            payload.model_dump(mode="json", exclude={"images"}),
             self.settings.model_dump(mode="json"),
+            image_urls=image_urls,
         )
         if len(branches) != planned_calls:
             raise CoreError("planner returned an unexpected number of branches")
@@ -167,6 +188,7 @@ class Gateway:
                 "schema_version": 1,
                 "request_id": request_id,
                 "config_id": self.settings.config_id,
+                "adapter_mode": self.settings.adapter.mode,
                 "duration_ms": round((time.perf_counter() - started) * 1000, 3),
                 "temperature": self.settings.adapter.temperature,
                 "aggregation_method": (
@@ -197,16 +219,26 @@ class Gateway:
             raise
 
     async def _run_branch(self, branch: dict[str, Any], key: str) -> dict[str, Any]:
-        body = {
+        body: dict[str, Any] = {
             "model": self.settings.upstream.model,
             "messages": branch["messages"],
-            "max_tokens": 1,
-            "temperature": 1,
-            "logprobs": True,
-            "top_logprobs": self.settings.upstream.top_logprobs,
             "stream": False,
-            **self.settings.upstream.extra_body,
         }
+        if self.settings.adapter.mode == "reported_probability":
+            assert self.settings.generation is not None
+            body.update({
+                "max_tokens": self.settings.generation.max_tokens,
+                "temperature": self.settings.generation.temperature,
+                "response_format": {"type": "json_object"},
+            })
+        else:
+            body.update({
+                "max_tokens": 1,
+                "temperature": 1,
+                "logprobs": True,
+                "top_logprobs": self.settings.upstream.top_logprobs,
+            })
+        body.update(self.settings.upstream.extra_body)
         assert self._client is not None
         try:
             async with self._capacity.call_slots:
@@ -248,15 +280,20 @@ class Gateway:
                 raise RequestError(502, "Upstream response has invalid usage")
 
         try:
-            parsed = parse_response(
-                data,
-                branch["mapping"],
-                self.settings.adapter.temperature,
-                self.settings.diagnostics.low_mass_threshold,
-            )
+            if self.settings.adapter.mode == "reported_probability":
+                parsed = parse_reported_response(
+                    data, branch["mapping"], self.settings.adapter.temperature
+                )
+            else:
+                parsed = parse_response(
+                    data,
+                    branch["mapping"],
+                    self.settings.adapter.temperature,
+                    self.settings.diagnostics.low_mass_threshold,
+                )
         except CoreError as exc:
             raise RequestError(502, "Upstream response could not be interpreted") from exc
-        return {**branch, **parsed, "usage": usage}
+        return {**branch, **parsed, "adapter_mode": self.settings.adapter.mode, "usage": usage}
 
     @staticmethod
     def _branch_diagnostics(run: dict[str, Any]) -> dict[str, Any]:

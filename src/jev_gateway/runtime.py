@@ -100,6 +100,7 @@ class GatewayRuntime:
             ),
             "config_id": settings.config_id,
             "mode": "round_robin" if settings.adapter.double_round_robin else "single",
+            "adapter_mode": settings.adapter.mode,
             "temperature": settings.adapter.temperature,
         }
 

@@ -3,11 +3,14 @@
 base_url = "https://api.deepseek.com"
 model = "deepseek-flash"
 api_key_env = "DEEPSEEK_API_KEY"
+# Enable only after selecting an upstream model that accepts image inputs.
+supports_images = false
 # Provider-specific field; omit this table for providers that do not support it.
 [upstream.extra_body]
 thinking = { type = "disabled" }
 
 [adapter]
+mode = "token_logprobs"
 # Post-processing temperature, not generation temperature. 1 means unchanged.
 temperature = 1.0
 double_round_robin = false

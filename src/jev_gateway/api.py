@@ -20,10 +20,11 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .config import Settings
-from .schema import SystemOneRequest, SystemOneResponse
+from .config import InferenceConfig, Settings
+from .images import MAX_IMAGES, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, MAX_TOTAL_IMAGE_BYTES
+from .schema import EvaluationRequest, EvaluationResponse, SystemOneRequest, SystemOneResponse
 from .runtime import GatewayRuntime, StdinControl
-from .service import RequestError
+from .service import Gateway, RequestError
 
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _RELEASE_DATE = "2026-09-20"
@@ -52,9 +53,99 @@ def _failure_event(request: Request, status: int) -> dict[str, Any]:
         "event": "evaluation.failed",
         "request_id": request.state.request_id,
         "config_id": request.state.settings.config_id,
+        "adapter_mode": request.state.settings.adapter.mode,
         "duration_ms": round((time.perf_counter() - request.state.started) * 1000, 3),
         "status": status,
     }
+
+
+def _branch_log(branch: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "question_id": branch["question_id"],
+        "index": branch["index"],
+        "adapter_mode": branch["adapter_mode"],
+        "warning_count": len(branch["warnings"]),
+        "warning_codes": [warning["code"] for warning in branch["warnings"]],
+    }
+    if branch["adapter_mode"] == "reported_probability":
+        result["normalization_delta"] = branch["normalization_delta"]
+    else:
+        result.update({
+            "observed_label_mass": branch["observed_label_mass"],
+            "label_mass_upper_bound": branch["label_mass_upper_bound"],
+            "missing_label_count": len(branch["missing_labels"]),
+        })
+    return result
+
+
+def _applicability_warnings(
+    execution: InferenceConfig, payload: SystemOneRequest
+) -> list[dict[str, str]]:
+    warnings: list[dict[str, str]] = []
+    only_noul = all(question.type == "noul" for question in payload.questions.values())
+    if only_noul and execution.adapter.double_round_robin:
+        warnings.append({
+            "code": "round_robin_unused", "field": "execution.adapter.double_round_robin",
+            "message": "Double round robin applies only to Choice and Score questions.",
+        })
+    if only_noul and execution.adapter.callsigns:
+        warnings.append({
+            "code": "callsigns_unused", "field": "execution.adapter.callsigns",
+            "message": "Noul questions use Yes and No labels.",
+        })
+    if (
+        execution.adapter.mode == "reported_probability"
+        and "low_mass_threshold" in execution.diagnostics.model_fields_set
+    ):
+        warnings.append({
+            "code": "low_mass_threshold_unused",
+            "field": "execution.diagnostics.low_mass_threshold",
+            "message": "Reported probabilities do not use token label mass.",
+        })
+    return warnings
+
+
+async def _evaluate_with_disconnect(
+    gateway: Gateway, payload: SystemOneRequest, request: Request
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    evaluation = asyncio.create_task(gateway.evaluate(payload, request.state.request_id))
+
+    async def wait_for_disconnect() -> None:
+        # The envelope middleware has consumed and replayed the body. Waiting
+        # on the raw receive preserves cancellation when the client leaves.
+        while True:
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
+                return
+
+    disconnected = asyncio.create_task(wait_for_disconnect())
+    try:
+        done, _ = await asyncio.wait(
+            {evaluation, disconnected}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if disconnected in done and not evaluation.done():
+            evaluation.cancel()
+            await asyncio.gather(evaluation, return_exceptions=True)
+            raise RequestError(499, "Client disconnected")
+        disconnected.cancel()
+        await asyncio.gather(disconnected, return_exceptions=True)
+        response, diagnostics = await evaluation
+    except BaseException:
+        for task in (evaluation, disconnected):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(evaluation, disconnected, return_exceptions=True)
+        raise
+    _log_event({
+        "event": "evaluation.completed",
+        "request_id": diagnostics["request_id"],
+        "config_id": diagnostics["config_id"],
+        "adapter_mode": diagnostics["adapter_mode"],
+        "duration_ms": diagnostics["duration_ms"],
+        "branches": [_branch_log(branch) for branch in diagnostics["branches"]],
+        "usage": diagnostics["usage"],
+    })
+    return response, diagnostics
 
 
 class _RequestEnvelopeMiddleware:
@@ -85,7 +176,7 @@ class _RequestEnvelopeMiddleware:
             if message["type"] == "http.response.start":
                 response_headers = MutableHeaders(scope=message)
                 response_headers["x-typesafe-request-id"] = request_id
-                response_headers["x-jev-config-id"] = settings.config_id
+                response_headers["x-jev-config-id"] = scope["state"]["settings"].config_id
             await send(message)
 
         chunks: list[bytes] = []
@@ -181,7 +272,7 @@ def create_app(
 
     @app.exception_handler(RequestError)
     async def request_error_handler(request: Request, exc: RequestError) -> JSONResponse:
-        if request.url.path == "/v1/systemone":
+        if request.url.path in {"/v1/systemone", "/v1/evaluate"}:
             _log_event(_failure_event(request, exc.status))
         response = _error(exc.status, exc.message)
         if exc.status in {429, 503, 529}:
@@ -200,7 +291,7 @@ def create_app(
             }
             for error in exc.errors()
         ]
-        if request.url.path == "/v1/systemone":
+        if request.url.path in {"/v1/systemone", "/v1/evaluate"}:
             _log_event(_failure_event(request, 422))
         return JSONResponse(
             status_code=422,
@@ -275,65 +366,34 @@ def create_app(
             "max_calls_per_request": settings.server.max_calls_per_request,
             "max_concurrent_requests": settings.server.max_concurrent_requests,
             "max_concurrent_calls": settings.server.max_concurrent_calls,
+            "max_images": MAX_IMAGES,
+            "max_image_bytes": MAX_IMAGE_BYTES,
+            "max_total_image_bytes": MAX_TOTAL_IMAGE_BYTES,
+            "max_image_pixels": MAX_IMAGE_PIXELS,
         }
 
     @app.post("/v1/systemone", response_model=SystemOneResponse)
     async def systemone(payload: SystemOneRequest, request: Request) -> dict[str, Any]:
-        evaluation = asyncio.create_task(
-            request.state.gateway.evaluate(payload, request.state.request_id)
-        )
-
-        async def wait_for_disconnect() -> None:
-            # The envelope middleware has already consumed and replayed the
-            # request body. Waiting on the raw ASGI receive is cancellable;
-            # Request.is_disconnected() uses a cancelled AnyIO scope for its
-            # probe and can leave this watcher stuck during response cleanup.
-            while True:
-                message = await request.receive()
-                if message["type"] == "http.disconnect":
-                    return
-
-        disconnected = asyncio.create_task(wait_for_disconnect())
-        try:
-            done, _ = await asyncio.wait(
-                {evaluation, disconnected}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if disconnected in done and not evaluation.done():
-                evaluation.cancel()
-                await asyncio.gather(evaluation, return_exceptions=True)
-                raise RequestError(499, "Client disconnected")
-            disconnected.cancel()
-            await asyncio.gather(disconnected, return_exceptions=True)
-            response, diagnostics = await evaluation
-        except BaseException:
-            for task in (evaluation, disconnected):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(evaluation, disconnected, return_exceptions=True)
-            raise
-        _log_event(
-            {
-                "event": "evaluation.completed",
-                "request_id": diagnostics["request_id"],
-                "config_id": diagnostics["config_id"],
-                "duration_ms": diagnostics["duration_ms"],
-                "branches": [
-                    {
-                        "question_id": branch["question_id"],
-                        "index": branch["index"],
-                        "observed_label_mass": branch["observed_label_mass"],
-                        "label_mass_upper_bound": branch["label_mass_upper_bound"],
-                        "missing_label_count": len(branch["missing_labels"]),
-                        "warning_count": len(branch["warnings"]),
-                        "warning_codes": [
-                            warning["code"] for warning in branch["warnings"]
-                        ],
-                    }
-                    for branch in diagnostics["branches"]
-                ],
-                "usage": diagnostics["usage"],
-            }
+        response, _ = await _evaluate_with_disconnect(
+            request.state.gateway, payload, request
         )
         return response
+
+    @app.post("/v1/evaluate", response_model=EvaluationResponse)
+    async def evaluate(body: EvaluationRequest, request: Request) -> dict[str, Any]:
+        gateway = request.state.gateway.with_execution(body.execution)
+        request.state.settings = gateway.settings
+        warnings = _applicability_warnings(body.execution, body.request)
+        common = {
+            "dry_run": body.dry_run,
+            "config_id": gateway.settings.config_id,
+            "execution": body.execution,
+            "warnings": warnings,
+        }
+        if body.dry_run:
+            plan = gateway.plan(body.request)
+            return {**common, "plan": {"request_count": len(plan), "requests": plan}}
+        result, _ = await _evaluate_with_disconnect(gateway, body.request, request)
+        return {**common, "result": result}
 
     return app

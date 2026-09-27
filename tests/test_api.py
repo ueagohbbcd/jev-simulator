@@ -323,6 +323,10 @@ def test_api_auth_key_separation_headers_models_limits_and_health(monkeypatch, c
             "max_calls_per_request": 256,
             "max_concurrent_requests": 16,
             "max_concurrent_calls": 8,
+            "max_images": 8,
+            "max_image_bytes": 12_582_912,
+            "max_total_image_bytes": 33_554_432,
+            "max_image_pixels": 16_000_000,
         }
         result = local.post(
             "/v1/systemone",
@@ -546,7 +550,8 @@ def test_non_ascii_configured_downstream_key_does_not_crash_auth(monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_client_disconnect_cancels_inflight_evaluation(monkeypatch) -> None:
+@pytest.mark.parametrize("path", ["/v1/systemone", "/v1/evaluate"])
+async def test_client_disconnect_cancels_inflight_evaluation(monkeypatch, path: str) -> None:
     monkeypatch.setenv("UPSTREAM_TEST_KEY", "key")
     entered = asyncio.Event()
     cancelled = asyncio.Event()
@@ -562,13 +567,14 @@ async def test_client_disconnect_cancels_inflight_evaluation(monkeypatch) -> Non
 
     upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = create_app(_settings(), client=upstream)
-    body = json.dumps(
-        {
-            "model": "jev-latest",
-            "state": "state",
-            "questions": {"q": {"type": "noul", "instructions": "ask"}},
-        }
-    ).encode()
+    payload = {
+        "model": "jev-latest",
+        "state": "state",
+        "questions": {"q": {"type": "noul", "instructions": "ask"}},
+    }
+    body = json.dumps(payload if path == "/v1/systemone" else {
+        "request": payload, "execution": {},
+    }).encode()
     first_receive = True
 
     async def receive() -> dict[str, Any]:
@@ -590,8 +596,8 @@ async def test_client_disconnect_cancels_inflight_evaluation(monkeypatch) -> Non
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
-        "path": "/v1/systemone",
-        "raw_path": b"/v1/systemone",
+        "path": path,
+        "raw_path": path.encode(),
         "query_string": b"",
         "root_path": "",
         "headers": [(b"content-type", b"application/json"), (b"host", b"testserver")],

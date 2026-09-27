@@ -39,7 +39,7 @@ def main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description="Jev-compatible decisions over Chat Completions logprobs")
+    parser = argparse.ArgumentParser(description="Jev-compatible decisions over Chat Completions")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, help_text in [
         ("check", "Validate configuration without network access"),
@@ -64,12 +64,16 @@ def main(argv=None) -> int:
         if args.command == "check":
             print(_json({"status": "ok", "config_id": settings.config_id,
                          "max_answers_per_question": settings.max_answers,
+                         "adapter_mode": settings.adapter.mode,
+                         "generation": settings.generation.model_dump() if settings.generation else None,
                          "temperature": settings.adapter.temperature,
                          "double_round_robin": settings.adapter.double_round_robin}))
         elif args.command == "preview":
             from .service import Gateway
             plan = Gateway(settings).plan(_payload(args.request))
-            print(_json({"config_id": settings.config_id, "request_count": len(plan), "requests": plan}))
+            print(_json({"config_id": settings.config_id, "adapter_mode": settings.adapter.mode,
+                         "generation": settings.generation.model_dump() if settings.generation else None,
+                         "request_count": len(plan), "requests": plan}))
         elif args.command == "evaluate":
             asyncio.run(_evaluate(settings, _payload(args.request), args.diagnostics))
         else:

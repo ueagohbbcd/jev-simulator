@@ -87,6 +87,7 @@ def test_subprocess_stdin_status_reload_failures_and_eof(tmp_path: Path) -> None
             "config_path": str(initial.resolve()),
             "config_id": first["config_id"],
             "mode": "single",
+            "adapter_mode": "token_logprobs",
             "temperature": 1.0,
         }
 
